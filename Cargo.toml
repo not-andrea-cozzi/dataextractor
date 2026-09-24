@@ -1,0 +1,10 @@
+[package]
+name = "dataextractor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+regex = "1.13.1"
+shakmaty = "0.30.1"
+tokio = "1.53.1"
