@@ -1,9 +1,9 @@
+mod engine;
 mod model;
 mod parser;
-mod engine;
-mod pgn_reader;
-use std::fs;
+mod game_reader;
 
+use std::fs;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,11 +12,13 @@ async fn main() -> anyhow::Result<()> {
     let output_path = args.get(2).cloned().unwrap_or_else(|| "graphs.json".to_string());
 
     // min_ply: scarta partite troppo corte per formare una finestra utile.
-    // 10 e' un default arbitrario (5 mosse per lato): da tarare tu in base
-    // a quanti ply prima del matto vuoi effettivamente osservare.
-    let min_ply: i32 = 10;
+    // 10 e' un default arbitrario (5 mosse per lato): da tarare in base a
+    // quanti ply prima del matto si vuole osservare. Tipo usize, non i32
+    // come nell'originale: parse_pgn_file_chunked_async si aspetta usize
+    // (indice di lunghezza vettore), un i32 non avrebbe compilato.
+    let min_ply: usize = 10;
 
-    let graphs = pipeline::parse_pgn_file_async(input_path, min_ply).await?;
+    let graphs = game_reader::parse_pgn_file_chunked_async(&input_path, min_ply).await?;
 
     eprintln!("Estratti {} grafi", graphs.len());
 
@@ -26,5 +28,4 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("Scritto output in {}", output_path);
 
     Ok(())
-
 }
