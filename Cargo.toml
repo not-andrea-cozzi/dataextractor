@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+indicatif = "0.18.6"
+num_cpus = "1.17.0"
 pgn-reader = "0.29.0"
 regex = "1.13.1"
 serde = { version = "1", features = ["derive"] }
