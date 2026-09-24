@@ -5,13 +5,16 @@ use shakmaty::{Chess, Position};
 
 use crate::engine::pre_filter::keep_game_meta;
 use crate::model::games::GameMetadata;
-use crate::model::graph::PlyRecord;
+use crate::model::graph::{parse_time_control, PlyRecord};
 
 pub struct GameState {
     pub metadata: GameMetadata,
     pub position: Chess,
     pub records: Vec<PlyRecord>,
-    last_clock: [Option<f32>; 2], // [bianco, nero]
+    /// Ultimo clock visto per lato: [bianco, nero]. None finché il lato non ha mosso.
+    last_clock: [Option<f32>; 2],
+    base_seconds: f32,
+    inc_seconds: f32,
     /// Distanza SF (mosse) dal matto forzato, e ply di inizio.
     pub mate_in_min: Option<u32>,
     pub mate_start_ply: Option<usize>,
@@ -19,11 +22,14 @@ pub struct GameState {
 
 impl GameState {
     fn new(metadata: GameMetadata) -> Self {
+        let (base_seconds, inc_seconds) = parse_time_control(&metadata.time_control);
         Self {
             metadata,
             position: Chess::default(),
             records: Vec::new(),
             last_clock: [None, None],
+            base_seconds,
+            inc_seconds,
             mate_in_min: None,
             mate_start_ply: None,
         }
@@ -36,6 +42,7 @@ impl GameState {
             .map(|r| Fen::from_position(&r.position.clone(), EnPassantMode::Legal).to_string())
     }
 
+    /// Frazione di ply con tempo speso valido.
     pub fn clock_coverage(&self) -> f32 {
         if self.records.is_empty() {
             return 0.0;
@@ -45,12 +52,13 @@ impl GameState {
     }
 }
 
+/// Estrae i secondi da un commento tipo "[%clk 0:09:58.3]".
 fn parse_clk_seconds(comment: &str) -> Option<f32> {
     let start = comment.find("%clk")?;
     let rest = comment[start + 4..].trim_start();
     let end = rest.find(']').unwrap_or(rest.len());
     let parts: Vec<&str> = rest[..end].trim().split(':').collect();
-    let f = |s: &str| s.parse::<f32>().ok();
+    let f = |s: &str| s.trim().parse::<f32>().ok();
     match parts.as_slice() {
         [h, m, s] => Some(f(h)? * 3600.0 + f(m)? * 60.0 + f(s)?),
         [m, s] => Some(f(m)? * 60.0 + f(s)?),
@@ -114,6 +122,7 @@ impl Visitor for GameVisitor {
             position: movetext.position.clone(),
             san: san_plus.to_string(),
             time_seconds: None,
+            clock_seconds: None,
         });
         ControlFlow::Continue(())
     }
@@ -124,17 +133,30 @@ impl Visitor for GameVisitor {
         comment: RawComment<'_>,
     ) -> ControlFlow<Self::Output> {
         let text = String::from_utf8_lossy(comment.as_bytes());
-        if let Some(clk) = parse_clk_seconds(&text) {
-            // il commento segue la mossa appena giocata: indice = ply-1
-            if let Some(last_idx) = movetext.records.len().checked_sub(1) {
-                let side = last_idx % 2;
-                if let Some(prev) = movetext.last_clock[side] {
-                    // NB: ignora l'incremento; sufficiente come feature relativa.
-                    movetext.records[last_idx].time_seconds = Some((prev - clk).max(0.0));
-                }
-                movetext.last_clock[side] = Some(clk);
-            }
+        let Some(clk) = parse_clk_seconds(&text) else {
+            return ControlFlow::Continue(());
+        };
+        // il commento segue la mossa appena giocata: indice = ply-1
+        let Some(last_idx) = movetext.records.len().checked_sub(1) else {
+            return ControlFlow::Continue(());
+        };
+        // un solo clock per mossa: ignora commenti %clk duplicati
+        if movetext.records[last_idx].clock_seconds.is_some() {
+            return ControlFlow::Continue(());
         }
+
+        let side = last_idx % 2; // 0 = bianco, 1 = nero
+        let spent = match movetext.last_clock[side] {
+            // clock dopo la mossa = clock prima - tempo speso + incremento
+            Some(prev) => prev - clk + movetext.inc_seconds,
+            // prima mossa del lato: nessun incremento accreditato
+            None => movetext.base_seconds - clk,
+        };
+
+        let rec = &mut movetext.records[last_idx];
+        rec.time_seconds = Some(spent.max(0.0));
+        rec.clock_seconds = Some(clk);
+        movetext.last_clock[side] = Some(clk);
         ControlFlow::Continue(())
     }
 

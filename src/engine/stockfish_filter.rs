@@ -51,10 +51,16 @@ pub fn annotate_game_sf(game: &mut GameState, sf: &mut Stockfish, opts: &ParseOp
             continue;
         };
         if let SfEval::Mate(m) = eval {
-            if m > 0 && (m as u32) >= opts.min_mate_in && (m as u32) <= opts.max_mate_in {
-                game.mate_in_min = Some(m as u32);
-                game.mate_start_ply = Some(i);
-                return true;
+            if m > 0 {
+                let m = m as u32;
+                if m >= opts.min_mate_in
+                    && m <= opts.max_mate_in
+                    && n - i == 2 * m as usize - 1
+                {
+                    game.mate_in_min = Some(m);
+                    game.mate_start_ply = Some(i);
+                    return true;
+                }
             }
         }
     }

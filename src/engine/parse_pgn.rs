@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -56,6 +57,12 @@ fn facts_from<'a>(game: &'a GameState, fen: &'a str, window: usize) -> Option<Ga
     })
 }
 
+/// Chiave di dedup della posizione: piazzamento, turno, arrocchi, en passant
+/// (senza i contatori di mossa, che rendevano uniche anche posizioni identiche).
+fn position_key(fen: &str) -> String {
+    fen.split_whitespace().take(4).collect::<Vec<_>>().join(" ")
+}
+
 fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGraph>> {
     let file = std::fs::File::open(path)?;
     let total_bytes = file.metadata()?.len();
@@ -65,18 +72,22 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
     // Canale limitato: il reader non produce più velocemente di SF.
     let (tx, rx) = mpsc::sync_channel::<(usize, GameState)>(workers * 4);
     let rx = Arc::new(Mutex::new(rx));
+    let window_mismatch = Arc::new(AtomicUsize::new(0));
 
     let mut handles = Vec::with_capacity(workers);
     for _ in 0..workers {
         let rx = Arc::clone(&rx);
         let opts = opts.clone();
+        let window_mismatch = Arc::clone(&window_mismatch);
+
         handles.push(thread::spawn(move || -> Vec<(usize, GameGraph)> {
+            // Se Stockfish non parte il worker esce: niente scarti silenziosi.
             let mut sf = if opts.require_sf {
                 match new_engine_with_opts(&opts) {
                     Ok(e) => Some(e),
                     Err(err) => {
                         eprintln!("[worker] Stockfish non avviato: {err:#}");
-                        None
+                        return Vec::new();
                     }
                 }
             } else {
@@ -91,23 +102,34 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
                     Err(_) => break,
                 };
 
-                let ok = match (opts.require_sf, sf.as_mut()) {
-                    (false, _) => true,
-                    (true, Some(e)) => annotate_game_sf(&mut game, e, &opts),
-                    (true, None) => false,
+                let ok = match sf.as_mut() {
+                    Some(e) => annotate_game_sf(&mut game, e, &opts),
+                    None => true,
                 };
                 if !ok {
                     continue;
                 }
 
                 let last = game.records.len() - 1;
-                // Finestra: dal ply di inizio del matto (o ultimi 2N ply) fino al matto.
+                // Finestra: dalla posizione che precede la prima mossa del matto forzato
+                // fino al matto. Senza SF: ultimi 2N ply.
                 let start = match game.mate_start_ply {
-                    Some(p) => p.saturating_sub(1), // include la posizione di partenza
-                    None => last.saturating_sub(2 * opts.max_mate_in as usize - 1),
+                    Some(p) => p.saturating_sub(1),
+                    None => last.saturating_sub((2 * opts.max_mate_in as usize).saturating_sub(1)),
                 };
-                let target = game.mate_in_min.unwrap_or(0);
-                out.push((idx, build_game_graph(&game.records[start..=last], target)));
+
+                // Coerenza label/finestra: mate-in-m <=> 2m record nella finestra.
+                if let Some(m) = game.mate_in_min {
+                    if last + 1 - start != 2 * m as usize {
+                        window_mismatch.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                }
+
+                out.push((
+                    idx,
+                    build_game_graph(&game.records[start..=last], game.mate_in_min, &game.metadata),
+                ));
             }
 
             if let Some(mut e) = sf {
@@ -160,12 +182,13 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
             *rejected.entry("duplicate_id").or_insert(0) += 1;
             continue;
         }
-        if !seen_final.insert(fen) {
+        if !seen_final.insert(position_key(&fen)) {
             *rejected.entry("duplicate_final_position").or_insert(0) += 1;
             continue;
         }
 
         if tx.send((matched, game)).is_err() {
+            eprintln!("[reader] tutti i worker sono terminati");
             break;
         }
         sent += 1;
@@ -186,6 +209,11 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
         "candidate: {matched} | inviate: {sent} | tenute: {}",
         graphs.len()
     ));
+
+    let mismatch = window_mismatch.load(Ordering::Relaxed);
+    if mismatch > 0 {
+        rejected.insert("window_mismatch", mismatch as u64);
+    }
 
     if !rejected.is_empty() {
         eprintln!("--- scarti ---");

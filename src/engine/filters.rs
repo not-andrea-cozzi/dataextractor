@@ -12,7 +12,6 @@ pub struct GameFacts<'a> {
     pub last_move_is_white: bool,
     pub final_fen: Option<&'a str>,
     pub clock_coverage: f32,
-    /// True se nella finestra finale compare una sottopromozione.
     pub underpromotion_in_window: bool,
 }
 

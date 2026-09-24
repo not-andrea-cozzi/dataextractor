@@ -1,7 +1,6 @@
 mod engine;
 mod model;
-
-use std::fs;
+mod out;
 
 use engine::parse_options::ParseOptions;
 use engine::parse_pgn::parse_pgn_file_chunked_async;
@@ -14,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "/home/coco/Desktop/TimeGnn/dataextractor/games.pgn".into());
-    let output_path = args.get(2).cloned().unwrap_or_else(|| "graphs.json".into());
+    let output_path = args.get(2).cloned().unwrap_or_else(|| "graphs.pt".into());
 
     let mut opts = ParseOptions::default();
     if let Some(sf) = args.get(3) {
@@ -23,10 +22,7 @@ async fn main() -> anyhow::Result<()> {
 
     let graphs = parse_pgn_file_chunked_async(&input_path, opts).await?;
     eprintln!("Estratti {} grafi", graphs.len());
-
-    // Scrittura in streaming (evita una stringa JSON gigante in RAM).
-    let file = std::io::BufWriter::new(fs::File::create(&output_path)?);
-    serde_json::to_writer(file, &graphs)?;
+    let _ = out::export::write_npz(&graphs, &output_path);
     eprintln!("Scritto output in {output_path}");
     Ok(())
 }
