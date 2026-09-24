@@ -1,28 +1,31 @@
-mod engine;
-mod model;
-mod out;
+mod analysis;
+mod chess;
+mod config;
+mod export;
+mod graph;
+mod pgn;
+mod pipeline;
 
-use engine::parse_options::ParseOptions;
-use engine::parse_pgn::parse_pgn_file_chunked_async;
+use config::ExtractConfig;
+
+const DEFAULT_INPUT: &str = "/home/coco/Desktop/TimeGnn/dataextractor/games.pgn";
+const DEFAULT_OUTPUT: &str = "graphs.npz";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args = std::env::args().skip(1);
+    let input = args.next().unwrap_or_else(|| DEFAULT_INPUT.into());
+    let output = args.next().unwrap_or_else(|| DEFAULT_OUTPUT.into());
 
-    let input_path = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "/home/coco/Desktop/TimeGnn/dataextractor/games.pgn".into());
-    let output_path = args.get(2).cloned().unwrap_or_else(|| "graphs.pt".into());
-
-    let mut opts = ParseOptions::default();
-    if let Some(sf) = args.get(3) {
-        opts.stockfish_path = sf.clone();
+    let mut cfg = ExtractConfig::default();
+    if let Some(sf) = args.next() {
+        cfg.stockfish.path = sf;
     }
 
-    let graphs = parse_pgn_file_chunked_async(&input_path, opts).await?;
+    let graphs = pipeline::extract_graphs(&input, cfg).await?;
     eprintln!("Estratti {} grafi", graphs.len());
-    let _ = out::export::write_npz(&graphs, &output_path);
-    eprintln!("Scritto output in {output_path}");
+
+    export::write_npz(&graphs, &output)?;
+    eprintln!("Scritto output in {output}");
     Ok(())
 }

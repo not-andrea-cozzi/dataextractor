@@ -5,11 +5,8 @@ use std::path::Path;
 use ndarray::{Array1, Array2};
 use ndarray_npy::NpzWriter;
 
-use crate::model::graph::{Edge, GameGraph};
-
-/// Feature per nodo: square, ply, piece_type, color, mate_in, turn.
+use crate::graph::{Edge, GameGraph};
 const NODE_F: usize = 6;
-/// Feature per ply: ply, castling (bitmask), ep_square (-1 se assente).
 const PLY_F: usize = 3;
 
 struct EdgeSet {
