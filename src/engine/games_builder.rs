@@ -1,8 +1,9 @@
 use std::ops::ControlFlow;
 
-use crate::game_reader::{RawComment, RawTag, SanPlus, Skip, Visitor};
+use pgn_reader::{RawComment, RawTag, SanPlus, Skip, Visitor};
 use shakmaty::{Chess, Position};
 
+use crate::engine::pre_filter::keep_game_meta;
 use crate::model::games::GameMetadata;
 use crate::model::graph::PlyRecord;
 
@@ -28,24 +29,13 @@ impl GameState {
 
 fn parse_clk_seconds(comment: &str) -> Option<f32> {
     let start = comment.find("%clk")?;
-    let rest = &comment[start + 4..];
-    let rest = rest.trim_start();
+    let rest = comment[start + 4..].trim_start();
     let end = rest.find(']').unwrap_or(rest.len());
     let time_str = rest[..end].trim();
 
-    let parts: Vec<&str> = time_str.split(':').collect();
-    match parts.as_slice() {
-        [h, m, s] => {
-            let h: f32 = h.parse().ok()?;
-            let m: f32 = m.parse().ok()?;
-            let s: f32 = s.parse().ok()?;
-            Some(h * 3600.0 + m * 60.0 + s)
-        }
-        [m, s] => {
-            let m: f32 = m.parse().ok()?;
-            let s: f32 = s.parse().ok()?;
-            Some(m * 60.0 + s)
-        }
+    match time_str.split(':').collect::<Vec<_>>().as_slice() {
+        [h, m, s] => Some(h.parse::<f32>().ok()? * 3600.0 + m.parse::<f32>().ok()? * 60.0 + s.parse::<f32>().ok()?),
+        [m, s] => Some(m.parse::<f32>().ok()? * 60.0 + s.parse::<f32>().ok()?),
         _ => None,
     }
 }
@@ -61,12 +51,7 @@ impl Visitor for GameVisitor {
         ControlFlow::Continue(GameMetadata::default())
     }
 
-    fn tag(
-        &mut self,
-        tags: &mut Self::Tags,
-        name: &[u8],
-        value: RawTag<'_>,
-    ) -> ControlFlow<Self::Output> {
+    fn tag(&mut self, tags: &mut Self::Tags, name: &[u8], value: RawTag<'_>) -> ControlFlow<Self::Output> {
         let val = String::from_utf8_lossy(value.as_bytes()).to_string();
 
         match name {
@@ -87,17 +72,16 @@ impl Visitor for GameVisitor {
     }
 
     fn begin_movetext(&mut self, tags: Self::Tags) -> ControlFlow<Self::Output, Self::Movetext> {
+        if !keep_game_meta(&tags) {
+            return ControlFlow::Break(None);
+        }
         ControlFlow::Continue(GameState::new(tags))
     }
 
-    fn san(
-        &mut self,
-        movetext: &mut Self::Movetext,
-        san_plus: SanPlus,
-    ) -> ControlFlow<Self::Output> {
+    fn san(&mut self, movetext: &mut Self::Movetext, san_plus: SanPlus) -> ControlFlow<Self::Output> {
         match san_plus.san.to_move(&movetext.position) {
             Ok(m) => {
-                movetext.position.play_unchecked(&m);
+                movetext.position.play_unchecked(m);
                 ControlFlow::Continue(())
             }
             Err(_) => {
@@ -107,11 +91,7 @@ impl Visitor for GameVisitor {
         }
     }
 
-    fn comment(
-        &mut self,
-        movetext: &mut Self::Movetext,
-        comment: RawComment<'_>,
-    ) -> ControlFlow<Self::Output> {
+    fn comment(&mut self, movetext: &mut Self::Movetext, comment: RawComment<'_>) -> ControlFlow<Self::Output> {
         let text = String::from_utf8_lossy(comment.as_bytes());
 
         if let Some(clk_seconds) = parse_clk_seconds(&text) {
@@ -119,18 +99,10 @@ impl Visitor for GameVisitor {
                 Some(prev) => (prev - clk_seconds).max(0.0),
                 None => 0.0,
             };
-
-            movetext.records.push(PlyRecord {
-                position: movetext.position.clone(),
-                time_seconds: time_spent,
-            });
-
+            movetext.records.push(PlyRecord { position: movetext.position.clone(), time_seconds: time_spent });
             movetext.last_clock_seconds = Some(clk_seconds);
         } else {
-            movetext.records.push(PlyRecord {
-                position: movetext.position.clone(),
-                time_seconds: 0.0,
-            });
+            movetext.records.push(PlyRecord { position: movetext.position.clone(), time_seconds: 0.0 });
         }
 
         ControlFlow::Continue(())
@@ -141,6 +113,9 @@ impl Visitor for GameVisitor {
     }
 
     fn end_game(&mut self, movetext: Self::Movetext) -> Self::Output {
+        if !movetext.position.is_checkmate() {
+            return None;
+        }
         Some(movetext)
     }
 }

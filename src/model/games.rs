@@ -7,9 +7,3 @@ pub struct GameMetadata {
     pub termination: String,
     pub results: String,
 }
-
-#[derive(Clone, Default, Debug)]
-pub struct PgnGame {
-    pub metadata: GameMetadata,
-    pub pgn_text: String,
-}

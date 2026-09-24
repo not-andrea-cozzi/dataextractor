@@ -1,5 +1,5 @@
 use serde::Serialize;
-use shakmaty::{Chess, Square};
+use shakmaty::{Chess, Color, Position, Role, Square};
 
 #[derive(Debug, Clone)]
 pub struct PlyRecord {
@@ -7,13 +7,14 @@ pub struct PlyRecord {
     pub time_seconds: f32,
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeFeature {
+    #[serde(serialize_with = "serialize_square")]
     pub square: Square,
     pub ply: u32,
-    pub piece_type: u8, // 0=none,1=pawn,2=knight,3=bishop,4=rook,5=queen,6=king
-    pub color: i8,       // -1=black, 0=none, 1=white
+    pub piece_type: u8,
+    pub color: i8,
+    pub mate_in: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -31,6 +32,7 @@ pub struct AttackEdge {
 #[derive(Debug, Clone, Serialize)]
 pub struct PinEdge {
     pub edge: Edge,
+    #[serde(serialize_with = "serialize_square")]
     pub king_square: Square,
 }
 
@@ -40,12 +42,63 @@ pub struct TemporalEdge {
     pub time_normalized: f32,
 }
 
+fn serialize_square<S>(square: &Square, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_str(&square.to_string())
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GameGraph {
-    pub nodes: Vec<NodeFeature>, // len = 64 * K
+    pub nodes: Vec<NodeFeature>,
     pub legal_move_edges: Vec<Edge>,
     pub attack_edges: Vec<AttackEdge>,
     pub pin_edges: Vec<PinEdge>,
     pub temporal_edges: Vec<TemporalEdge>,
-    pub target_mate_in: Option<u32>, // None se non porta a mate entro l'orizzonte
+    pub target_mate_in: Option<u32>,
+}
+
+fn piece_type_code(role: Role) -> u8 {
+    match role {
+        Role::Pawn => 1,
+        Role::Knight => 2,
+        Role::Bishop => 3,
+        Role::Rook => 4,
+        Role::Queen => 5,
+        Role::King => 6,
+    }
+}
+
+pub fn build_game_graph(records: &[PlyRecord]) -> GameGraph {
+    let mut nodes = Vec::with_capacity(records.len() * 64);
+    let last_idx = records.len().saturating_sub(1);
+
+    for (ply, record) in records.iter().enumerate() {
+        let mate_in = (last_idx - ply) as u32;
+
+        for square in Square::ALL {
+            let (piece_type, color) = match record.position.board().piece_at(square) {
+                Some(p) => (
+                    piece_type_code(p.role),
+                    if p.color == Color::White { 1 } else { -1 },
+                ),
+                None => (0, 0),
+            };
+
+            nodes.push(NodeFeature {
+                square,
+                ply: ply as u32,
+                piece_type,
+                color,
+                mate_in,
+            });
+        }
+    }
+
+    GameGraph {
+        nodes,
+        target_mate_in: Some(0),
+        ..Default::default()
+    }
 }
