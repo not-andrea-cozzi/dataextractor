@@ -30,7 +30,6 @@ pub fn run(
     window_mismatch: &AtomicUsize,
     no_mate: &AtomicUsize,
 ) -> Vec<WorkerOutput> {
-    // Se Stockfish non parte il worker esce: niente scarti silenziosi.
     let mut sf = if cfg.use_stockfish {
         match start_engine(&cfg.stockfish) {
             Ok(e) => Some(e),

@@ -38,14 +38,12 @@ pub struct QualityFilterConfig {
 pub struct MateConfig {
     pub min_mate_in: u32,
     pub max_mate_in: u32,
-    /// Quanti ply finali analizzare con Stockfish.
     pub lookback_plies: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct ExtractConfig {
     pub stockfish: StockfishConfig,
-    /// Se false si salta Stockfish e si prende la finestra finale fissa.
     pub use_stockfish: bool,
     pub metadata: MetadataFilterConfig,
     pub quality: QualityFilterConfig,
@@ -61,7 +59,7 @@ impl Default for ExtractConfig {
             stockfish: StockfishConfig {
                 path: "/usr/games/stockfish".into(),
                 threads: 1,
-                hash_mb: 32,
+                hash_mb: 8,
                 depth: 14,
                 pool_size: num_cpus::get().max(1),
             },
@@ -83,7 +81,6 @@ impl Default for ExtractConfig {
                 min_clock_coverage: 0.8,
                 reject_underpromotion: true,
                 require_defender_piece: true,
-                // Maschere materiali (default OFF: scartano matti tattici post-sacrificio).
                 require_attacker_advantage: false,
                 min_attacker_material: 0,
                 min_heavy_pieces_traded: 0,

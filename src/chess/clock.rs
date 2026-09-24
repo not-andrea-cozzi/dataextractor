@@ -6,10 +6,11 @@ pub fn parse_time_control(tc: &str) -> (f32, f32) {
     (base, inc)
 }
 
+
 pub fn parse_clk_seconds(comment: &str) -> Option<f32> {
-    let start = comment.find("%clk")?;
-    let rest = comment[start + 4..].trim_start();
-    let end = rest.find(']').unwrap_or(rest.len());
+    let start: usize = comment.find("%clk")?;
+    let rest: &str = comment[start + 4..].trim_start();
+    let end: usize = rest.find(']').unwrap_or(rest.len());
     let parts: Vec<&str> = rest[..end].trim().split(':').collect();
     let f = |s: &str| s.trim().parse::<f32>().ok();
     match parts.as_slice() {
