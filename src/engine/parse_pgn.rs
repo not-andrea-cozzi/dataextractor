@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -6,7 +7,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use pgn_reader::Reader as PgnReader;
 
 use crate::engine::filters::{reject_reason, GameFacts};
-use crate::engine::games_builder::GameVisitor;
+use crate::engine::games_builder::{GameState, GameVisitor};
 use crate::engine::parse_options::ParseOptions;
 use crate::engine::stockfish_filter::{annotate_game_sf, new_engine_with_opts};
 use crate::model::graph::{build_game_graph, GameGraph};
@@ -24,7 +25,6 @@ fn make_progress_bar(total_bytes: u64) -> ProgressBar {
     pb
 }
 
-/// Wrapper async: sposta tutto su un thread bloccante.
 pub async fn parse_pgn_file_chunked_async(
     path: impl AsRef<Path>,
     opts: ParseOptions,
@@ -33,49 +33,46 @@ pub async fn parse_pgn_file_chunked_async(
     tokio::task::spawn_blocking(move || parse_blocking(&path, opts)).await?
 }
 
-// ---------------------------------------------------------------------------
-// Adattatori: GameState -> GameFacts
-// ---------------------------------------------------------------------------
-// TODO(adatta): qui devi solo sistemare i nomi dei campi/metodi del TUO GameState.
-fn facts_from<'a>(game: &'a GameState) -> Option<GameFacts<'a>> {
+fn underpromotion_in_window(game: &GameState, window: usize) -> bool {
+    let n = game.records.len();
+    game.records[n.saturating_sub(window)..]
+        .iter()
+        .any(|r| r.san.contains("=N") || r.san.contains("=B") || r.san.contains("=R"))
+}
+
+fn facts_from<'a>(game: &'a GameState, fen: &'a str, window: usize) -> Option<GameFacts<'a>> {
     let last = game.records.last()?;
-    let last_move_is_white = (game.records.len() - 1) % 2 == 0;
-
-    // Se il tuo GameState ha già `final_fen()`, usa quello.
-    let final_fen: Option<&'a str> = last.fen_after.as_deref();
-
     Some(GameFacts {
         ply_count: game.records.len(),
-        result: game.headers.get("Result").map(String::as_str),
-        eco: game.headers.get("ECO").map(String::as_str),
-        white_elo: game.headers.get("WhiteElo").and_then(|s| s.parse().ok()),
-        black_elo: game.headers.get("BlackElo").and_then(|s| s.parse().ok()),
+        result: Some(game.metadata.results.as_str()),
+        eco: (!game.metadata.eco.is_empty()).then_some(game.metadata.eco.as_str()),
+        white_elo: Some(game.metadata.white_elo),
+        black_elo: Some(game.metadata.black_elo),
         last_san: last.san.as_str(),
-        last_move_is_white,
-        final_fen,
+        last_move_is_white: (game.records.len() - 1) % 2 == 0,
+        final_fen: Some(fen),
+        clock_coverage: game.clock_coverage(),
+        underpromotion_in_window: underpromotion_in_window(game, window),
     })
 }
 
-// ---------------------------------------------------------------------------
-// Implementazione bloccante
-// ---------------------------------------------------------------------------
 fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGraph>> {
     let file = std::fs::File::open(path)?;
     let total_bytes = file.metadata()?.len();
     let pb = make_progress_bar(total_bytes);
 
-    // ---- Canale verso i worker Stockfish ----
-    let (tx, rx) = mpsc::channel::<(usize, GameState)>();
+    let workers = opts.engine_pool_size.max(1);
+    // Canale limitato: il reader non produce più velocemente di SF.
+    let (tx, rx) = mpsc::sync_channel::<(usize, GameState)>(workers * 4);
     let rx = Arc::new(Mutex::new(rx));
 
-    let mut handles = Vec::with_capacity(opts.engine_pool_size.max(1));
-    for _ in 0..opts.engine_pool_size.max(1) {
+    let mut handles = Vec::with_capacity(workers);
+    for _ in 0..workers {
         let rx = Arc::clone(&rx);
         let opts = opts.clone();
         handles.push(thread::spawn(move || -> Vec<(usize, GameGraph)> {
             let mut sf = if opts.require_sf {
-                match new_engine_with_opts(&opts.stockfish_path, opts.sf_threads, opts.sf_hash_mb)
-                {
+                match new_engine_with_opts(&opts) {
                     Ok(e) => Some(e),
                     Err(err) => {
                         eprintln!("[worker] Stockfish non avviato: {err:#}");
@@ -86,42 +83,31 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
                 None
             };
 
-            let mut out: Vec<(usize, GameGraph)> = Vec::new();
-
+            let mut out = Vec::new();
             loop {
-                // Lock brevissimo: serve solo per estrarre un job.
-                let job = {
-                    let guard = rx.lock().unwrap();
-                    guard.recv()
-                };
+                let job = rx.lock().unwrap().recv();
                 let (idx, mut game) = match job {
                     Ok(v) => v,
-                    Err(_) => break, // sender chiuso → fine
+                    Err(_) => break,
                 };
 
-                // ---- annotazione SF ----
-                let sf_ok = match (opts.require_sf, sf.as_mut()) {
+                let ok = match (opts.require_sf, sf.as_mut()) {
                     (false, _) => true,
-                    (true, Some(engine)) => annotate_game_sf(&mut game, engine),
+                    (true, Some(e)) => annotate_game_sf(&mut game, e, &opts),
                     (true, None) => false,
                 };
-                if !sf_ok {
+                if !ok {
                     continue;
                 }
 
-                // ---- min_mate_in (post-SF) ----
-                // TODO(adatta): se `annotate_game_sf` non espone la distanza,
-                // modificala per restituire `Option<i32>` (mate_in positivo).
-                // if opts.min_mate_in > 0 {
-                //     if let Some(mi) = game.sf_mate_in() {
-                //         if mi < opts.min_mate_in as i32 { continue; }
-                //     }
-                // }
-
-                // ---- finestra finale → grafo ----
                 let last = game.records.len() - 1;
-                let start = last.saturating_sub(opts.max_mate_in);
-                out.push((idx, build_game_graph(&game.records[start..=last])));
+                // Finestra: dal ply di inizio del matto (o ultimi 2N ply) fino al matto.
+                let start = match game.mate_start_ply {
+                    Some(p) => p.saturating_sub(1), // include la posizione di partenza
+                    None => last.saturating_sub(2 * opts.max_mate_in as usize - 1),
+                };
+                let target = game.mate_in_min.unwrap_or(0);
+                out.push((idx, build_game_graph(&game.records[start..=last], target)));
             }
 
             if let Some(mut e) = sf {
@@ -131,21 +117,22 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
         }));
     }
 
-    // ---- Reader sul thread corrente ----
     let reader = std::io::BufReader::with_capacity(opts.buffer_bytes, pb.wrap_read(file));
     let mut pgn_reader = PgnReader::new(reader);
     let mut visitor = GameVisitor;
 
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut seen_final: HashSet<String> = HashSet::new();
     let mut matched = 0usize;
     let mut sent = 0usize;
-    let mut rejected: std::collections::HashMap<&'static str, u64> =
-        std::collections::HashMap::new();
+    let mut rejected: std::collections::HashMap<&'static str, u64> = Default::default();
+    let window = opts.lookback_plies;
 
     while let Some(opt) = pgn_reader.read_game(&mut visitor)? {
         let Some(game) = opt else { continue };
 
         if let Some(max) = opts.max_games {
-            if matched >= max {
+            if sent >= max {
                 break;
             }
         }
@@ -155,8 +142,11 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
             pb.set_message(format!("candidate: {matched} | inviate: {sent}"));
         }
 
-        // ---- pre-filtri (economici) ----
-        let Some(facts) = facts_from(&game) else {
+        let Some(fen) = game.final_fen() else {
+            *rejected.entry("no_final_fen").or_insert(0) += 1;
+            continue;
+        };
+        let Some(facts) = facts_from(&game, &fen, window) else {
             *rejected.entry("no_facts").or_insert(0) += 1;
             continue;
         };
@@ -165,15 +155,23 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
             continue;
         }
 
-        // ---- invia al pool SF ----
+        // Dedup per id partita e per posizione finale.
+        if !game.metadata.game_id.is_empty() && !seen_ids.insert(game.metadata.game_id.clone()) {
+            *rejected.entry("duplicate_id").or_insert(0) += 1;
+            continue;
+        }
+        if !seen_final.insert(fen) {
+            *rejected.entry("duplicate_final_position").or_insert(0) += 1;
+            continue;
+        }
+
         if tx.send((matched, game)).is_err() {
-            break; // tutti i worker sono morti
+            break;
         }
         sent += 1;
     }
-    drop(tx); // chiude il canale → i worker escono dal loop
+    drop(tx);
 
-    // ---- Raccolta risultati ----
     let mut results: Vec<(usize, GameGraph)> = Vec::new();
     for h in handles {
         match h.join() {
@@ -181,18 +179,16 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
             Err(_) => eprintln!("[worker] panicked"),
         }
     }
-    results.sort_by_key(|(i, _)| *i); // ordine stabile
-
+    results.sort_by_key(|(i, _)| *i);
     let graphs: Vec<GameGraph> = results.into_iter().map(|(_, g)| g).collect();
 
-    // ---- Report finale ----
     pb.finish_with_message(format!(
         "candidate: {matched} | inviate: {sent} | tenute: {}",
         graphs.len()
     ));
 
     if !rejected.is_empty() {
-        eprintln!("--- filtri ---");
+        eprintln!("--- scarti ---");
         let mut v: Vec<_> = rejected.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         for (reason, n) in v {
@@ -200,10 +196,17 @@ fn parse_blocking(path: &Path, opts: ParseOptions) -> anyhow::Result<Vec<GameGra
         }
     }
 
+    // Distribuzione mate_in (per bilanciamento).
+    let mut dist = [0usize; 16];
+    for g in &graphs {
+        if let Some(t) = g.target_mate_in {
+            dist[(t as usize).min(15)] += 1;
+        }
+    }
+    eprintln!("--- distribuzione mate-in ---");
+    for (n, c) in dist.iter().enumerate().filter(|(_, c)| **c > 0) {
+        eprintln!("  mate-in-{n}: {c}");
+    }
+
     Ok(graphs)
 }
-
-// ---------------------------------------------------------------------------
-// Placeholder: sostituisci con il TUO tipo reale.
-// ---------------------------------------------------------------------------
-// use crate::engine::games_builder::GameState;   // <-- importa il tuo tipo

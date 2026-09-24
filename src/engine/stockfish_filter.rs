@@ -3,55 +3,27 @@ use shakmaty::{EnPassantMode, Position};
 use stockfish::{EvalType, Stockfish};
 
 use crate::engine::games_builder::GameState;
+use crate::engine::parse_options::ParseOptions;
 
-/// Quanti ply finali analizzare con Stockfish.
-pub const LOOKBACK_PLIES: usize = 12;
-/// Profondita' di ricerca (u32 nella crate `stockfish` 0.2.11).
-pub const SF_DEPTH: u32 = 16;
-/// Matto forzato massimo (in mosse) accettato dal filtro.
-pub const MATE_MAX: i32 = 5;
-pub const MIN_PLIES: usize = 20;
-pub const MAX_PLIES: usize = 120;
-
-pub fn new_engine(path: &str) -> anyhow::Result<Stockfish> {
-    let mut sf = Stockfish::new(path)?;
+pub fn new_engine_with_opts(opts: &ParseOptions) -> anyhow::Result<Stockfish> {
+    let mut sf = Stockfish::new(&opts.stockfish_path)?;
     sf.setup_for_new_game()?;
-    sf.set_depth(SF_DEPTH); // ritorna (), nessun Result
+    sf.set_option("Threads", &opts.sf_threads.to_string())?;
+    sf.set_option("Hash", &opts.sf_hash_mb.to_string())?;
+    sf.set_depth(opts.sf_depth);
     Ok(sf)
 }
 
-
-/// Come `new_engine`, ma imposta Threads/Hash via UCI.
-pub fn new_engine_with_opts(
-    path: &str,
-    threads: u32,
-    hash_mb: u32,
-) -> anyhow::Result<Engine> {
-    let mut engine = new_engine(path)?;
-
-    // Le opzioni UCI vanno impostate dopo "uci" e prima di "isready".
-    // Adatta i nomi dei metodi al tuo wrapper:
-    engine.set_option("Threads", &threads.to_string())?;
-    engine.set_option("Hash", &hash_mb.to_string())?;
-    engine.set_option("MultiPV", "1")?;
-    engine.isready()?;
-
-    Ok(engine)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SfEval {
+#[derive(Debug, Clone, Copy)]
+enum SfEval {
     Cp(i32),
-    Mate(i32),
+    Mate(i32), // >0 = il lato al tratto matta
 }
 
-fn evaluate(sf: &mut Stockfish, position: &shakmaty::Chess) -> Option<SfEval> {
-    let fen = Fen::from_position(&position.clone(), EnPassantMode::Legal).to_string();
-
+fn evaluate(sf: &mut Stockfish, pos: &shakmaty::Chess) -> Option<SfEval> {
+    let fen = Fen::from_position(&pos.clone(), EnPassantMode::Legal).to_string();
     sf.set_fen_position(&fen).ok()?;
-    let out = sf.go().ok()?;
-    let eval = out.eval();
-
+    let eval = sf.go().ok()?.eval();
     Some(match eval.eval_type() {
         EvalType::Centipawn => SfEval::Cp(eval.value()),
         EvalType::Mate => SfEval::Mate(eval.value()),
@@ -59,43 +31,32 @@ fn evaluate(sf: &mut Stockfish, position: &shakmaty::Chess) -> Option<SfEval> {
 }
 
 
-pub fn annotate_game_sf(game: &mut GameState, sf: &mut Stockfish) -> bool {
-    let ply_count = game.records.len();
-
-    if ply_count < MIN_PLIES || ply_count > MAX_PLIES {
+pub fn annotate_game_sf(game: &mut GameState, sf: &mut Stockfish, opts: &ParseOptions) -> bool {
+    let n = game.records.len();
+    if n < 2 {
         return false;
     }
+    let mating_side_parity = (n - 1) % 2; // parità dell'indice dell'ultima mossa (0 = bianco)
+    let start = n.saturating_sub(opts.lookback_plies).max(1);
 
-    game.eval_trace.clear();
+
     game.mate_in_min = None;
     game.mate_start_ply = None;
 
-    let start = ply_count.saturating_sub(LOOKBACK_PLIES);
-
-    for idx in start..ply_count {
-        let Some(eval) = evaluate(sf, &game.records[idx].position) else {
-            game.eval_trace.push(0);
+    for i in start..n {
+        if i % 2 != mating_side_parity {
+            continue;
+        }
+        let Some(eval) = evaluate(sf, &game.records[i - 1].position) else {
             continue;
         };
-
-        match eval {
-            SfEval::Cp(cp) => game.eval_trace.push(cp),
-            SfEval::Mate(n) => {
-                let sentinel = 100_000 - n.abs();
-                game.eval_trace.push(if n > 0 { sentinel } else { -sentinel });
-
-                if n > 0 && n <= MATE_MAX && game.mate_start_ply.is_none() {
-                    game.mate_in_min = Some(n as u32);
-                    game.mate_start_ply = Some(idx);
-                }
+        if let SfEval::Mate(m) = eval {
+            if m > 0 && (m as u32) >= opts.min_mate_in && (m as u32) <= opts.max_mate_in {
+                game.mate_in_min = Some(m as u32);
+                game.mate_start_ply = Some(i);
+                return true;
             }
         }
     }
-
-    game.mate_in_min.is_some()
-}
-
-/// Wrapper booleano compatibile con la vecchia firma `keep_game_sf`.
-pub fn keep_game_sf(game: &mut GameState, sf: &mut Stockfish) -> bool {
-    annotate_game_sf(game, sf)
+    false
 }

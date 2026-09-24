@@ -1,8 +1,10 @@
 mod engine;
-mod game_reader;
 mod model;
 
 use std::fs;
+
+use engine::parse_options::ParseOptions;
+use engine::parse_pgn::parse_pgn_file_chunked_async;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -11,27 +13,20 @@ async fn main() -> anyhow::Result<()> {
     let input_path = args
         .get(1)
         .cloned()
-        .unwrap_or_else(|| "/home/coco/Desktop/TimeGnn/dataextractor/games.pgn".to_string());
-    let output_path = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| "graphs.json".to_string());
-    let stockfish_path = args
-        .get(3)
-        .cloned()
-        .unwrap_or_else(|| "/usr/games/stockfish".to_string());
+        .unwrap_or_else(|| "/home/coco/Desktop/TimeGnn/dataextractor/games.pgn".into());
+    let output_path = args.get(2).cloned().unwrap_or_else(|| "graphs.json".into());
 
-    let min_ply: usize = 10;
+    let mut opts = ParseOptions::default();
+    if let Some(sf) = args.get(3) {
+        opts.stockfish_path = sf.clone();
+    }
 
-    let graphs =
-        game_reader::parse_pgn_file_chunked_async(&input_path, stockfish_path, min_ply).await?;
-
+    let graphs = parse_pgn_file_chunked_async(&input_path, opts).await?;
     eprintln!("Estratti {} grafi", graphs.len());
 
-    let json = serde_json::to_string(&graphs)?;
-    fs::write(&output_path, json)?;
-
-    eprintln!("Scritto output in {}", output_path);
-
+    // Scrittura in streaming (evita una stringa JSON gigante in RAM).
+    let file = std::io::BufWriter::new(fs::File::create(&output_path)?);
+    serde_json::to_writer(file, &graphs)?;
+    eprintln!("Scritto output in {output_path}");
     Ok(())
 }

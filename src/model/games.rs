@@ -6,4 +6,5 @@ pub struct GameMetadata {
     pub time_control: String,
     pub termination: String,
     pub results: String,
+    pub eco: String,
 }
